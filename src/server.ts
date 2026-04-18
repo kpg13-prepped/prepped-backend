@@ -1,11 +1,11 @@
-import { runRecommendation } from "./recommendationEngine";
+import { runRecommendation } from "./recommendationEngine.js";
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import crypto from "node:crypto";
 import cookieParser from "cookie-parser";
 import { Resend } from "resend";
-import { db } from "./db";
+import { db } from "./db.js";
 
 const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
 console.log("DB tables:", tables);
