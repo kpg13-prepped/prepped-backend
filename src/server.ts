@@ -711,11 +711,39 @@ function demoResults(q: string, note?: string) {
   };
 }
 
+function escapeCqlLike(value: string): string {
+  return value.replace(/'/g, "''").trim();
+}
+
 async function getLiveAddressResults(q: string, apiKey: string): Promise<AddressResult[] | null> {
-  const liveUrl = `https://data.linz.govt.nz/services;key=${encodeURIComponent(apiKey)}/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=layer-123113&outputFormat=application/json&srsName=EPSG:4326&count=8&CQL_FILTER=${encodeURIComponent(`full_address ilike '${q.replace(/'/g, "''") }%'`)}`;
+  const safeQ = escapeCqlLike(q);
+  const filter = [
+    `full_address ilike '%${safeQ}%'`,
+    `suburb_locality ilike '%${safeQ}%'`,
+    `town_city ilike '%${safeQ}%'`,
+  ].join(" OR ");
+
+  const liveUrl = `https://data.linz.govt.nz/services;key=${encodeURIComponent(apiKey)}/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=layer-123113&outputFormat=application/json&srsName=EPSG:4326&count=8&CQL_FILTER=${encodeURIComponent(filter)}`;
+
+  console.log("ADDRESS SEARCH HIT", {
+    q,
+    time: new Date().toISOString(),
+  });
+  console.log("LINZ KEY PRESENT?", Boolean(apiKey));
+  console.log("LINZ KEY LENGTH", apiKey ? apiKey.length : 0);
+  console.log("LINZ URL", liveUrl.replace(apiKey, "[REDACTED]"));
+
   const response = await fetch(liveUrl, { headers: { Accept: "application/json" } });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) return null;
+  const rawText = await response.text();
+
+  console.log("LINZ STATUS", response.status, response.statusText);
+  console.log("LINZ RAW RESPONSE", rawText.slice(0, 500));
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const data = JSON.parse(rawText || "{}");
 
   const rawResults = Array.isArray((data as any)?.features)
     ? (data as any).features
