@@ -1,10 +1,14 @@
-import "dotenv/config";
-import crypto from "node:crypto";
+import { runRecommendation } from "./recommendationEngine";
 import express from "express";
 import cors from "cors";
+import "dotenv/config";
+import crypto from "node:crypto";
 import cookieParser from "cookie-parser";
-import Database from "better-sqlite3";
 import { Resend } from "resend";
+import { db } from "./db";
+
+const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
+console.log("DB tables:", tables);
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -18,7 +22,6 @@ app.use(
 
 const port = Number(process.env.PORT || 3001);
 const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-const dbPath = process.env.SQLITE_PATH || "./prepped.sqlite";
 const cookieName = process.env.AUTH_COOKIE_NAME || "prepped_auth";
 const magicMinutes = Number(process.env.MAGIC_LINK_MINUTES || 15);
 const authDays = Number(process.env.AUTH_SESSION_DAYS || 30);
@@ -26,7 +29,6 @@ const resendApiKey = process.env.RESEND_API_KEY || "";
 const emailFrom = process.env.EMAIL_FROM || "PREPPED <onboarding@example.com>";
 const resend = resendApiKey ? new Resend(resendApiKey) : null;
 
-const db = new Database(dbPath);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
@@ -793,23 +795,140 @@ app.post("/api/customer-upsert", (req, res) => {
 app.post("/api/profile-save", (req, res) => {
   try {
     const body = (req.body || {}) as AnyRecord;
-    const profile = saveProfile(normaliseProfilePayload(body));
-    insertSnapshot(profile.profileId, "profile_save", {
-      sessionId: profile.sessionId,
-      recommendation: profile.recommendation || {},
+    const sessionId = asString(body.sessionId || body.session_id) || makeId("session");
+    const existing = loadProfileBySessionId(sessionId);
+    const generatedAt = nowIso();
+
+    const location: AnyRecord = {
+      text: asString(body.location_text || body.locationText) || null,
+      region: asString(body.location_region || body.locationRegion) || null,
+    };
+
+    const household: AnyRecord = {
+      adults: asNumber(body.adults),
+      children: asNumber(body.children),
+      babies: asNumber(body.babies),
+      pets: asNumber(body.pets),
+    };
+
+    const logistics: AnyRecord = {
+      housingType: asString(body.housing_type || body.housingType) || null,
+      storageSpace: asString(body.storage_space || body.storageSpace) || null,
+      vehicleCount: asNumber(body.vehicle_count || body.vehicleCount),
+      vehicleCapacity: asNumber(body.vehicle_capacity || body.vehicleCapacity),
+    };
+
+    const readiness: AnyRecord = {
+      foodDepth: asString(body.food_depth || body.foodDepth) || null,
+      waterDepth: asString(body.water_depth || body.waterDepth) || null,
+      blackoutReady: Boolean(body.blackout_ready ?? body.blackoutReady),
+      firstAidReady: Boolean(body.first_aid_ready ?? body.firstAidReady),
+      documentsReady: Boolean(body.documents_ready ?? body.documentsReady),
+    };
+
+    const recommendation = runRecommendation({
+      adults: household.adults as number,
+      babies: household.babies as number,
+      children: household.children as number,
+      pets: household.pets as number,
+      location_region: location.region as string | undefined,
+      housing_type: logistics.housingType as string | undefined,
+      vehicle_count: logistics.vehicleCount as number,
+      storage_space: logistics.storageSpace as string | undefined,
+      food_depth: readiness.foodDepth as string | undefined,
+      water_depth: readiness.waterDepth as string | undefined,
+      blackout_ready: readiness.blackoutReady as boolean,
+      first_aid_ready: readiness.firstAidReady as boolean,
+      documents_ready: readiness.documentsReady as boolean,
+    }) as unknown as AnyRecord;
+
+    const saved = saveProfile({
+      profileId: existing?.profileId || asString(body.profileId || body.profile_id) || makeId("profile"),
+      customerId: asString(body.customerId || body.customer_id) || existing?.customerId || null,
+      sessionId,
+      answers: Object.keys((body.answers as AnyRecord) || {}).length ? (body.answers as AnyRecord) : body,
+      recommendation,
+      location,
+      household,
+      logistics,
+      readiness,
+      generatedAt,
+      createdAt: existing?.createdAt,
+      updatedAt: generatedAt,
+    });
+
+    insertSnapshot(saved.profileId, "profile-save", {
+      sessionId,
+      location,
+      household,
+      logistics,
+      readiness,
+      recommendation,
     });
 
     res.json({
       ok: true,
-      profileId: profile.profileId,
-      customerId: profile.customerId ?? null,
-      sessionId: profile.sessionId,
-      savedAt: profile.updatedAt,
-      profile,
+      profileId: saved.profileId,
+      customerId: saved.customerId ?? null,
+      sessionId: saved.sessionId,
+      savedAt: saved.updatedAt,
+      profile: saved,
     });
   } catch (error) {
     console.error("profile-save failed", error);
     res.status(500).json({ ok: false, error: "Failed to save profile" });
+  }
+});
+
+app.get("/api/profile-load/:profileId", (req, res) => {
+  try {
+    const { profileId } = req.params;
+
+    const row = db
+      .prepare(
+        `
+        SELECT *
+        FROM profiles
+        WHERE profile_id = ?
+        LIMIT 1
+      `
+      )
+      .get(profileId) as any;
+
+    if (!row) {
+      return res.status(404).json({
+        ok: false,
+        error: "Profile not found",
+      });
+    }
+
+    const profile = {
+      profileId: row.profile_id,
+      customerId: row.customer_id,
+      sessionId: row.session_id,
+      answers: row.answers_json ? JSON.parse(row.answers_json) : {},
+      recommendation: row.recommendation_json
+        ? JSON.parse(row.recommendation_json)
+        : {},
+      location: row.location_json ? JSON.parse(row.location_json) : {},
+      household: row.household_json ? JSON.parse(row.household_json) : {},
+      logistics: row.logistics_json ? JSON.parse(row.logistics_json) : {},
+      readiness: row.readiness_json ? JSON.parse(row.readiness_json) : {},
+      generatedAt: row.generated_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+
+    res.json({
+      ok: true,
+      profile,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      error: "Failed to load profile",
+    });
   }
 });
 
@@ -951,5 +1070,4 @@ app.post("/api/auth/logout", (req, res) => {
 
 app.listen(port, () => {
   console.log(`PREPPED backend listening on http://localhost:${port}`);
-  console.log(`SQLite path: ${dbPath}`);
 });
